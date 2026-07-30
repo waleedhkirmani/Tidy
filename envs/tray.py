@@ -11,3 +11,10 @@ class Tray:
             useFixedBase=True,
             globalScaling=glob_scale,
         )
+        aabb_min, aabb_max = p.getAABB(self.id)
+        self.half_length = (aabb_max[0] - aabb_min[0]) / 2
+        self.half_width = (aabb_max[1] - aabb_min[1]) / 2
+        self.top = aabb_max[2]
+
+    def get_current_pos(self):
+        return p.getBasePositionAndOrientation(self.id)[0]
