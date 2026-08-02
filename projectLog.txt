@@ -1,0 +1,49 @@
+Starting:
+  Installed pybullet. tried to understand the joint systems.
+  learned about inverse kinematics, just the basic intuition
+  first moved the robotic arm to 1 new position at the time
+  then tried moving it sequentially to 3 positions, usually just adding a minus to the previous ones
+  found out about the limits and that such big movements get the robot stuck with itself
+  next implemented a slider to get the robot under control
+  placed a cube and then wrote a script for the robo arm to pick it up
+  managed to get the arm on top of the cube, though had issues with robot getting stuck with itself
+  closed the gripper and got the robot to a new coordinate but the arm went flying
+  adjusted this by increasing the force of the gripper and also dividing the arm motion into
+  first going up and then moving to the new location, slowing everything down
+  then placed a tray. new objective, get the cube into the tray
+  got everything done, but the script was not very reliable, sometimes it did not work
+
+Classes:
+  Started making classes for objects, mostly copying code from my existing script
+  Made new classes for cube and tray, self sufficient and holding important information
+  Got the classes implementation to run, but the errors i faced above were much more frequent here
+  I got to learn how torque and gravity work here and how the force variable actually limits the joints
+  increased the force of one major joint and now the robot got much closer. but still not perfect
+  i realized that at one point, the robot gave the function its next desired coordinate
+  that was the coordinate of the cube. the new joint angles came out from the IK, and the robot committed
+  to it till the end. and thus got stuck at some point in between
+  so i instead got it to go to a middle point, and then recalculate the joint angles from IK
+  this way, it never got stuck and my script became 100% reliable
+
+Environment Design:
+  basic structure was there from the classes. I just had to gymnasium-code it
+  first read gymnasium custom environment documentation
+  then started implementing the __init__, reset and step function
+  also made helper functions. Got separation of tasks
+  made the action space and observation space. Also wrote terminated condition which is a BIT flawed currently
+  then changed the runner script to how gymnasium environments actually run
+  the robot is right now a dumb thing that just moves randomly, as it is sampling the action space
+  i changed the action space to make it more probable get to the cube, just experimenting.
+  it did get close but at times got stuck. So i found out that i haven't yet introduced limits
+
+Reward Design:
+  First broke down the task into smaller tasks. Then designed a reward function for each subtask
+  Getting to the cube, grasping it, lifting it up, getting above the tray, coming down, placing the cube in the tray
+  Getting to the cube involved rewarding progress made in the direction of the cube.
+  Grasp simply rewarded 1 if the robot grasped the cube, else 0
+  Lift checked if robot is gripping the cube, and if the new height of the cube is higher than its previous height. It returned height difference
+  But it returned 0 when the height reached 0.6, with the idea being that the robot should not continue going on to the ceiling and going higher
+  I didn't punish it for that because then it would not come down at all later, which is crucial for descent
+  Approach tray reward just rewarded getting closer to the tray
+  Lower into tray reward meant that the cube is in the air right above the tray, and we just need to descent it. It rewarded decrease in height. 
+  And it also rewarded staying centred with respect to the tray. It punished opening the gripper

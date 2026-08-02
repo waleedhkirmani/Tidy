@@ -19,8 +19,11 @@ class TidyEnv:
         )
 
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(10,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(9,), dtype=np.float32
         )
+
+        self.workspace_low = np.array([0.15, -0.4, 0.1], dtype=np.float32)
+        self.workspace_high = np.array([1.0, 0.4, 0.8], dtype=np.float32)
 
         p.connect(p.GUI)
         # Use pybullet's built in assets
@@ -46,18 +49,13 @@ class TidyEnv:
         self.small_cube = self._spawn_small_cube()
         self.tray = self._spawn_tray()
 
-        initial_pos = [0.5, 0.0, 0.7]
-        initial_orn = p.getQuaternionFromEuler([0, -math.pi, 0])
-        joint_angles = p.calculateInverseKinematics(
-            self.robot.id,
-            11,
-            initial_pos,
-            targetOrientation=initial_orn,
-        )
-        for i in range(7):
-            p.resetJointState(self.robot.id, i, joint_angles[i])
+        self.robot.reset()
 
         self.robot.open_claw()
+        self._previous_cube_height = None
+        self._old_distance_from_cube = None
+        self._old_cube_distance_from_tray = None
+        self.success_status = False
 
         info = {}
 
@@ -68,6 +66,8 @@ class TidyEnv:
         target_position = self._calculate_target_position(
             action[:3], self.robot.get_end_effector_pos()
         )
+
+        target_position = self._clip_target_position(target_position)
         converged = self._move_to(target_position)
 
         if not converged:
@@ -79,8 +79,106 @@ class TidyEnv:
         else:
             self.robot.close_claw()
 
-        terminated = self._is_cube_in_tray()
-        return (self._get_obs(), 0, terminated, False, {})
+        reward = self._calculate_reward()
+        terminated = self.success_status
+        return (self._get_obs(), reward, terminated, False, {})
+
+    def _calculate_reward(self):
+        # now we need to actually design this
+        # moving pieces: reach_cube. grasp_reward. lift_reward. approach_tray. lower_into. success
+        # Parrarelizing:
+        # reach_cube + grasp_reward.
+        # Then. lift_reward
+        # Then. approach_tray
+        # Then. lower_into + success
+        reward = 0
+        if not self.robot.is_gripping():
+            reward += self._reach_cube_reward()
+            reward += self._grasp_reward()
+        else:
+            reward += self._lift_reward()
+            if not self._is_cube_centralized_wrt_tray():
+                reward += self._approach_tray_reward()
+            else:
+                reward += self._lower_into_tray_reward()
+                success_reward, self.success_status = self._success_reward()
+                reward += success_reward
+        return reward - 0.001
+
+    def _reach_cube_reward(self):
+        current_distance = self._get_distance_from_cube()
+        if (
+            self._old_distance_from_cube is None
+        ):  # this is for the first step after reset only
+            self._old_distance_from_cube = current_distance
+            return 0
+        reward = self._old_distance_from_cube - current_distance
+        self._old_distance_from_cube = current_distance
+        return reward
+
+    def _grasp_reward(self):
+        return 1 if self.robot.is_gripping() else 0
+
+    def _lift_reward(self):
+        if self.robot.is_gripping():
+            current_height = self.small_cube.get_current_pos()[2]
+
+            if self._previous_cube_height is None:
+                self._previous_cube_height = self.small_cube.get_current_pos()[2]
+            height_diff = current_height - self._previous_cube_height
+            self._previous_cube_height = current_height
+            if current_height > 0.6:
+                self._previous_cube_height = current_height
+                return 0
+            return height_diff
+        else:
+            return 0
+
+    def _approach_tray_reward(
+        self,
+    ):  # TODO: Maybe add a feature where it does not count z at all
+        current_distance = self._get_cube_distance_from_tray()
+        if self._old_cube_distance_from_tray is None:
+            self._old_cube_distance_from_tray = current_distance
+            return 0
+        reward = self._old_cube_distance_from_tray - current_distance
+        self._old_cube_distance_from_tray = current_distance
+        return reward
+
+    def _lower_into_tray_reward(self):
+        # Reward staying centralized wrt to the tray
+        if self._is_cube_centralized_wrt_tray():
+            reward = 0.5
+        else:
+            reward = 0
+
+        current_height = self.small_cube.get_current_pos()[2]
+
+        if self._previous_cube_height is None:
+            self._previous_cube_height = current_height
+        else:
+            height_diff = self._previous_cube_height - current_height
+            reward += height_diff
+            self._previous_cube_height = current_height
+        if not self.robot.gripper_closed:
+            reward -= 1
+        return reward
+
+    def _success_reward(self):
+        reward = 0
+        if self._is_cube_in_tray():
+            reward += 50
+            return reward, True
+        return 0, False
+
+    def _get_distance_from_cube(self):
+        return np.linalg.norm(
+            np.array(self.robot.get_end_effector_pos())
+            - np.array(self.small_cube.get_current_pos())
+        )
+
+    def _clip_target_position(self, target_position):
+        return np.clip(target_position, self.workspace_low, self.workspace_high)
 
     def _get_obs(self):
         return np.array(
@@ -90,6 +188,20 @@ class TidyEnv:
                 *self.tray.get_current_pos(),
             ],
             dtype=np.float32,
+        )
+
+    def _get_cube_distance_from_tray(self):
+        return np.linalg.norm(
+            np.array(self.small_cube.get_current_pos())
+            - np.array(self.tray.get_current_pos())
+        )
+
+    def _is_cube_centralized_wrt_tray(self):
+        cube_pos = self.small_cube.get_current_pos()
+        tray_pos = self.tray.get_current_pos()
+        return (
+            abs(cube_pos[0] - tray_pos[0]) < self.tray.half_length
+            and abs(cube_pos[1] - tray_pos[1]) < self.tray.half_width
         )
 
     def _spawn_small_cube(self, basePos=[0.45, 0.4, 0.01], rgba=[0, 1, 0, 1]):
@@ -102,14 +214,10 @@ class TidyEnv:
         return self.tray
 
     def _is_cube_in_tray(self):
-        cube_pos = self.small_cube.get_current_pos()
-        tray_pos = self.tray.get_current_pos()
-
-        x_ok = abs(cube_pos[0] - tray_pos[0]) < self.tray.half_length
-        y_ok = abs(cube_pos[1] - tray_pos[1]) < self.tray.half_width
-        z_ok = cube_pos[2] < self.tray.top
-
-        return x_ok and y_ok and z_ok
+        return (
+            self._is_cube_centralized_wrt_tray()
+            and self.small_cube.get_current_pos()[2] < self.tray.top
+        )
 
     def check_ik_reachability(self, target_position, target_orientation):
         saved = [p.getJointState(self.robot.id, i)[0] for i in range(7)]
@@ -201,29 +309,29 @@ class TidyEnv:
         return False
 
     def motion(self):
-        self.move_to([0.43, 0.42, 0.7])
-        self.move_to([0.43, 0.42, 0.3])
+        self._move_to([0.43, 0.42, 0.7])
+        self._move_to([0.43, 0.42, 0.3])
 
-        self.move_to([0.43, 0.42, 0.01])
+        self._move_to([0.43, 0.42, 0.01])
         self.robot.close_claw()
         zz = 0.1
         yy = 0.42
         xx = 0.43
 
         zz += 0.5
-        self.move_to([xx, yy, zz])
+        self._move_to([xx, yy, zz])
         yy -= 0.425
-        self.move_to([xx, yy, zz])
+        self._move_to([xx, yy, zz])
         xx = 0.525
         yy = -0.30
-        self.move_to([xx, yy, zz])
+        self._move_to([xx, yy, zz])
         zz -= 0.25
-        self.move_to([xx, yy, zz])
+        self._move_to([xx, yy, zz])
         zz -= 0.25
-        self.move_to([xx, yy, zz])
+        self._move_to([xx, yy, zz])
         zz -= 0.25
-        self.move_to([xx, yy, zz])
+        self._move_to([xx, yy, zz])
         time.sleep(1 / 140)
         self.robot.open_claw()
         zz += 0.5
-        self.move_to([xx, yy, zz])
+        self._move_to([xx, yy, zz])
