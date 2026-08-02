@@ -8,37 +8,41 @@ from .robot import Robot
 from .small_cube import SmallCube
 from .tray import Tray
 
+WORKSPACE_LOW = np.array([0.15, -0.4, 0.1], dtype=np.float32)
+WORKSPACE_HIGH = np.array([1.0, 0.4, 0.8], dtype=np.float32)
+
 
 class TidyEnv:
-    def __init__(self):
+    def __init__(self, gui=True):
 
+        # RL
         self.action_space = spaces.Box(
             low=np.array([-0.05, -0.05, -0.05, 0], dtype=np.float32),
             high=np.array([0.05, 0.05, 0.05, 1], dtype=np.float32),
             dtype=np.float32,
         )
-
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(9,), dtype=np.float32
         )
 
-        self.workspace_low = np.array([0.15, -0.4, 0.1], dtype=np.float32)
-        self.workspace_high = np.array([1.0, 0.4, 0.8], dtype=np.float32)
+        # Environment
+        self.workspace_low = WORKSPACE_LOW
+        self.workspace_high = WORKSPACE_HIGH
+        self.max_episode_steps = 200
 
-        p.connect(p.GUI)
-        # Use pybullet's built in assets
-        p.setAdditionalSearchPath(pybullet_data.getDataPath())
-        p.setGravity(0, 0, -9.81)
-        p.loadURDF("plane.urdf")
+        # Physics
+        if gui:
+            p.connect(p.GUI)
+        else:
+            p.connect(p.DIRECT)
 
+        self._setup_physics()
+
+        if gui:
+            self._setup_graphics()
+
+        # Robot
         self.robot = Robot()
-
-        p.resetDebugVisualizerCamera(
-            cameraDistance=1.7,
-            cameraYaw=90,
-            cameraPitch=-35,
-            cameraTargetPosition=[0.5, 0.0, 0.2],
-        )
 
     def reset(self):
         if hasattr(self, "small_cube") and self.small_cube:
@@ -56,23 +60,23 @@ class TidyEnv:
         self._old_distance_from_cube = None
         self._old_cube_distance_from_tray = None
         self.success_status = False
+        self.step_count = 0
 
         info = {}
 
         return self._get_obs(), info
 
     def step(self, action):
+
+        self.step_count += 1
+
         # The action would be delta x, delta y, delta z, and gripper 0/1
         target_position = self._calculate_target_position(
             action[:3], self.robot.get_end_effector_pos()
         )
 
         target_position = self._clip_target_position(target_position)
-        converged = self._move_to(target_position)
-
-        if not converged:
-            # Handle failure
-            print("Not Converged")
+        self._move_to(target_position)
 
         if action[3] > 0.5:
             self.robot.open_claw()
@@ -81,29 +85,24 @@ class TidyEnv:
 
         reward = self._calculate_reward()
         terminated = self.success_status
-        return (self._get_obs(), reward, terminated, False, {})
+        truncated = self.step_count >= 200
+        info = {"rewards": self.step_rewards}
+        return (self._get_obs(), reward, terminated, truncated, info)
 
     def _calculate_reward(self):
-        # now we need to actually design this
-        # moving pieces: reach_cube. grasp_reward. lift_reward. approach_tray. lower_into. success
-        # Parrarelizing:
-        # reach_cube + grasp_reward.
-        # Then. lift_reward
-        # Then. approach_tray
-        # Then. lower_into + success
-        reward = 0
+        r = {"reach": 0, "grasp": 0, "lift": 0, "approach": 0, "lower": 0, "success": 0}
         if not self.robot.is_gripping():
-            reward += self._reach_cube_reward()
-            reward += self._grasp_reward()
+            r["reach"] = self._reach_cube_reward()
+            r["grasp"] = self._grasp_reward()
         else:
-            reward += self._lift_reward()
+            r["lift"] = self._lift_reward()
             if not self._is_cube_centralized_wrt_tray():
-                reward += self._approach_tray_reward()
+                r["approach"] = self._approach_tray_reward()
             else:
-                reward += self._lower_into_tray_reward()
-                success_reward, self.success_status = self._success_reward()
-                reward += success_reward
-        return reward - 0.001
+                r["lower"] = self._lower_into_tray_reward()
+                r["success"], self.success_status = self._success_reward()
+        self.step_rewards = r
+        return sum(r.values()) - 0.001
 
     def _reach_cube_reward(self):
         current_distance = self._get_distance_from_cube()
@@ -170,6 +169,19 @@ class TidyEnv:
             reward += 50
             return reward, True
         return 0, False
+
+    def _setup_physics(self):
+        p.setAdditionalSearchPath(pybullet_data.getDataPath())
+        p.setGravity(0, 0, -9.81)
+        p.loadURDF("plane.urdf")
+
+    def _setup_graphics(self):
+        p.resetDebugVisualizerCamera(
+            cameraDistance=1.7,
+            cameraYaw=90,
+            cameraPitch=-35,
+            cameraTargetPosition=[0.5, 0.0, 0.2],
+        )
 
     def _get_distance_from_cube(self):
         return np.linalg.norm(
@@ -252,9 +264,6 @@ class TidyEnv:
         target_orientation = p.getQuaternionFromEuler([0, -math.pi, 0])
         forces = [f] * 7
         forces[1] = 1000
-        # debugging shit
-        residual = self.check_ik_reachability(target_position, target_orientation)
-        print(f"IK residual: {residual:.4f}")
 
         for _ in range(max_steps):
             joint_angles = p.calculateInverseKinematics(
@@ -267,7 +276,6 @@ class TidyEnv:
                 jointRanges=self.robot.joint_ranges,
                 restPoses=self.robot.rest_poses,
             )
-            # print(joint_angles[:7])
             for i in range(7):
                 p.setJointMotorControl2(
                     bodyUniqueId=self.robot.id,
@@ -287,20 +295,11 @@ class TidyEnv:
             )
             distance = math.dist(current_position, target_position)
 
-            # print("Target :", target_position)
-            # print("Current:", current_position)
-            # print("Distance:", distance)
             if distance < 0.009:
                 return True
             if abs(last_distance - distance) < stall_eps:
                 stall_count += 1
                 if stall_count > stall_steps:
-                    current_angles = [
-                        p.getJointState(self.robot.id, i)[0] for i in range(7)
-                    ]
-                    print("commanded:", [round(a, 3) for a in joint_angles[:7]])
-                    print("actual:   ", [round(a, 3) for a in current_angles])
-                    print(f"move_to: stalled at distance={distance:.3f}")
                     return False
             else:
                 stall_count = 0
