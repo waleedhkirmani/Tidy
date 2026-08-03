@@ -1,7 +1,7 @@
 from statistics import mean
 from envs.tidy_env import TidyEnv
 
-env = TidyEnv(gui=False)
+env = TidyEnv(gui=True)
 print("Initialized")
 KEYS = ["reach", "grasp", "lift", "approach", "lower", "success"]
 rows = []

@@ -1,6 +1,5 @@
 import pybullet as p
 import math
-import time
 
 
 class Robot:
@@ -40,17 +39,22 @@ class Robot:
             self.rest_poses.append(p.getJointState(self.id, joint)[0])
 
         self.gripper_closed = False
+        self.cube_id = None
 
     def get_end_effector_pos(self):
         return p.getLinkState(self.id, 11)[0]
 
     def is_gripping(self):
-        contact_points = p.getContactPoints(bodyA=self.id, bodyB=-1)
-        left_finger_touching = any(contact[3] == 10 for contact in contact_points)
-        right_finger_touching = any(contact[3] == 11 for contact in contact_points)
+        if self.cube_id is None:
+            return False
+        contact_points = p.getContactPoints(bodyA=self.id, bodyB=self.cube_id)
+        left_finger_touching = any(contact[3] == 9 for contact in contact_points)
+        right_finger_touching = any(contact[3] == 10 for contact in contact_points)
         return left_finger_touching and right_finger_touching and self.gripper_closed
 
     def open_claw(self, f=200, target_position=0.04):
+        if not self.gripper_closed:
+            return
         for joint in [9, 10]:
             p.setJointMotorControl2(
                 bodyUniqueId=self.id,
@@ -59,12 +63,11 @@ class Robot:
                 targetPosition=target_position,
                 force=f,
             )
-        for _ in range(50):
-            p.stepSimulation()
-            time.sleep(1 / 240)
         self.gripper_closed = False
 
     def close_claw(self, f=200, target_position=0.0):
+        if self.gripper_closed:
+            return
         for joint in [9, 10]:
             p.setJointMotorControl2(
                 bodyUniqueId=self.id,
@@ -73,9 +76,8 @@ class Robot:
                 targetPosition=target_position,
                 force=f,
             )
-        for _ in range(50):
+        for _ in range(10):
             p.stepSimulation()
-            time.sleep(1 / 240)
         self.gripper_closed = True
 
     def reset(self):

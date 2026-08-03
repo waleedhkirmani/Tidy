@@ -24,7 +24,9 @@ class Actor(nn.Module):
         action = torch.tanh(z)
         log_prob = dist.log_prob(z).sum(dim=1, keepdim=True)
         log_prob -= torch.log(1 - action.pow(2) + 1e-6).sum(dim=1, keepdim=True)
-        action[:, :3] *= 0.05
+        action = torch.cat(
+            [action[:, :3] * 0.05, ((action[:, 3] + 1) / 2).unsqueeze(1)], dim=1
+        )
         return action, log_prob
 
 

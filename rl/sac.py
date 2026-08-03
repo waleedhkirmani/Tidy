@@ -25,15 +25,18 @@ class SAC:
         self.tau = 0.005
 
     def select_action(self, state):
+        state = torch.as_tensor(state, dtype=torch.float32).unsqueeze(0)
         action, _ = self.actor.sample(state)
         return action
 
-    def update(self, replay_buffer):
+    def update(self, replay_buffer, batch_size):
         # 1 Sample a batch
         # 2 Update both critics
         # 3 Update the actor
         # 4 Soft update the target critics
-        states, actions, rewards, next_states, dones = replay_buffer.sample()
+        states, actions, rewards, next_states, dones = replay_buffer.sample(
+            batch_size=batch_size
+        )
         self._update_critics(states, actions, rewards, next_states, dones)
         self._update_actor(states)
         self._soft_update_targets()

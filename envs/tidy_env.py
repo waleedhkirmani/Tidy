@@ -51,11 +51,14 @@ class TidyEnv:
             p.removeBody(self.tray.id)
 
         self.small_cube = self._spawn_small_cube()
+        self.robot.cube_id = self.small_cube.id
         self.tray = self._spawn_tray()
 
         self.robot.reset()
 
         self.robot.open_claw()
+        for _ in range(40):
+            p.stepSimulation()
         self._previous_cube_height = None
         self._old_distance_from_cube = None
         self._old_cube_distance_from_tray = None
@@ -76,7 +79,7 @@ class TidyEnv:
         )
 
         target_position = self._clip_target_position(target_position)
-        self._move_to(target_position)
+        self._advance_toward(target_position)
 
         if action[3] > 0.5:
             self.robot.open_claw()
@@ -85,7 +88,7 @@ class TidyEnv:
 
         reward = self._calculate_reward()
         terminated = self.success_status
-        truncated = self.step_count >= 200
+        truncated = self.step_count >= self.max_episode_steps
         info = {"rewards": self.step_rewards}
         return (self._get_obs(), reward, terminated, truncated, info)
 
@@ -254,6 +257,37 @@ class TidyEnv:
     def _calculate_target_position(self, action, current_position):
         current_position = np.asarray(current_position, dtype=np.float32)
         return current_position + action[:3]
+
+    def _advance_toward(self, target_position, n_steps=60, f=200):
+        # fixed-tick chase: one env step = one short burst, no convergence wait
+        target_position = np.asarray(target_position, dtype=np.float32)
+        target_orientation = p.getQuaternionFromEuler([0, -math.pi, 0])
+        forces = [f] * 7
+        forces[1] = 1000
+
+        for _ in range(n_steps):
+            joint_angles = p.calculateInverseKinematics(
+                self.robot.id,
+                11,
+                target_position,
+                target_orientation,
+                lowerLimits=self.robot.lower_limits,
+                upperLimits=self.robot.upper_limits,
+                jointRanges=self.robot.joint_ranges,
+                restPoses=self.robot.rest_poses,
+            )
+            for i in range(7):
+                p.setJointMotorControl2(
+                    bodyUniqueId=self.robot.id,
+                    jointIndex=i,
+                    controlMode=p.POSITION_CONTROL,
+                    targetPosition=joint_angles[i],
+                    force=forces[i],
+                    positionGain=0.3,
+                    velocityGain=1.0,
+                    maxVelocity=4.0,
+                )
+            p.stepSimulation()
 
     def _move_to(
         self, target_position, f=200, max_steps=2000, stall_steps=50, stall_eps=1e-4
