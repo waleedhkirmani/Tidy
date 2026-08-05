@@ -29,6 +29,14 @@ class Actor(nn.Module):
         )
         return action, log_prob
 
+    def action(self, state):
+        mu, _ = self.forward(state)
+        action = torch.tanh(mu)
+        action = torch.cat(
+            [action[:, :3] * 0.05, ((action[:, 3] + 1) / 2).unsqueeze(1)], dim=1
+        )
+        return action
+
 
 class Critic(nn.Module):
     def __init__(self):

@@ -29,6 +29,10 @@ class SAC:
         action, _ = self.actor.sample(state)
         return action
 
+    def select_best_action(self, state):
+        state = torch.as_tensor(state, dtype=torch.float32).unsqueeze(0)
+        return self.actor.action(state)
+
     def update(self, replay_buffer, batch_size):
         # 1 Sample a batch
         # 2 Update both critics

@@ -13,15 +13,23 @@ class Robot:
 
         self.initial_pos = initial_pos
         self.initial_orn = p.getQuaternionFromEuler([0, -math.pi, 0])
-        joint_angles = p.calculateInverseKinematics(
-            self.id,
-            11,
-            self.initial_pos,
-            targetOrientation=self.initial_orn,
-        )
-
+        # pybullet IK seeds from the current joint state and can get stuck in
+        # local minima; iterate it to a converged, reproducible home pose.
+        # Seed the forearm roll (joint 3) mid-range: parked at its upper limit
+        # (0.0) the solver returns infeasible solutions and jams the arm.
+        joint_angles = [0.0, 0.0, 0.0, -1.5, 0.0, 0.0, 0.0]
         for i in range(7):
             p.resetJointState(self.id, i, joint_angles[i])
+        for _ in range(12):
+            joint_angles = p.calculateInverseKinematics(
+                self.id,
+                11,
+                self.initial_pos,
+                targetOrientation=self.initial_orn,
+            )
+            for i in range(7):
+                p.resetJointState(self.id, i, joint_angles[i])
+        self.home_joint_angles = list(joint_angles)
 
         self.lower_limits = []
         self.upper_limits = []
@@ -81,12 +89,12 @@ class Robot:
         self.gripper_closed = True
 
     def reset(self):
-        joint_angles = p.calculateInverseKinematics(
-            self.id,
-            11,
-            self.initial_pos,
-            targetOrientation=self.initial_orn,
-        )
-
         for i in range(7):
-            p.resetJointState(self.id, i, joint_angles[i])
+            p.resetJointState(self.id, i, self.home_joint_angles[i])
+            p.setJointMotorControl2(
+                bodyUniqueId=self.id,
+                jointIndex=i,
+                controlMode=p.POSITION_CONTROL,
+                targetPosition=self.home_joint_angles[i],
+                force=200,
+            )

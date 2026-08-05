@@ -19,7 +19,7 @@ replay_buffer = ReplayBuffer()
 start_episode = load_checkpoint(sac)
 
 # %%
-
+j = 0
 for i in range(start_episode, start_episode + episode_len):
     state, info = env.reset()
     done = False
@@ -48,4 +48,5 @@ for i in range(start_episode, start_episode + episode_len):
     )
     if i % 100 == 0:
         save_checkpoint(sac, i)
-save_checkpoint(sac, i)
+    j = i
+save_checkpoint(sac, j)
