@@ -4,12 +4,19 @@ from gymnasium import spaces
 import numpy as np
 import time
 import math
+import random
 from .robot import Robot
 from .small_cube import SmallCube
 from .tray import Tray
 
-WORKSPACE_LOW = np.array([0.15, -0.4, 0.1], dtype=np.float32)
+WORKSPACE_LOW = np.array([0.15, -0.4, 0.0], dtype=np.float32)
 WORKSPACE_HIGH = np.array([1.0, 0.4, 0.8], dtype=np.float32)
+
+# Curriculum: start this fraction of episodes already hovering in-band above
+# the cube so the grasp->lift->place chain is actually sampled by the critic.
+CURRICULUM_PROB = 0.4
+CURRICULUM_DESCEND_Z = 0.02  # lands EE ~0.045 (IK residual), proven firm grip
+HOLD_INCOME = 0.05  # per-step reward while holding a real (clamped) grasp
 
 
 class TidyEnv:
@@ -28,7 +35,7 @@ class TidyEnv:
         # Environment
         self.workspace_low = WORKSPACE_LOW
         self.workspace_high = WORKSPACE_HIGH
-        self.max_episode_steps = 200
+        self.max_episode_steps = 400
 
         # Physics
         if gui:
@@ -55,13 +62,23 @@ class TidyEnv:
         self.tray = self._spawn_tray()
 
         self.robot.reset()
-
         self.robot.open_claw()
+        if random.random() < CURRICULUM_PROB:
+            # Descend onto the cube with the claw open (same motion as the
+            # scripted demo) so episodes start one close away from a firm grip.
+            cx, cy = self.small_cube.get_current_pos()[:2]
+            z = 0.30
+            while z > CURRICULUM_DESCEND_Z:
+                z = max(z - 0.05, CURRICULUM_DESCEND_Z)
+                self._advance_toward([cx, cy, z])
         for _ in range(40):
             p.stepSimulation()
         self._previous_cube_height = None
         self._old_distance_from_cube = None
+        self._band_bonus_claimed = False
         self._old_cube_distance_from_tray = None
+        self._prev_gripping = False
+        self._grasp_claimed = False
         self.success_status = False
         self.step_count = 0
 
@@ -93,19 +110,33 @@ class TidyEnv:
         return (self._get_obs(), reward, terminated, truncated, info)
 
     def _calculate_reward(self):
-        r = {"reach": 0, "grasp": 0, "lift": 0, "approach": 0, "lower": 0, "success": 0}
-        if not self.robot.is_gripping():
-            r["reach"] = self._reach_cube_reward()
+        r = {
+            "reach": 0,
+            "grasp": 0,
+            "lift": 0,
+            "hold": 0,
+            "approach": 0,
+            "lower": 0,
+            "success": 0,
+        }
+        gripping_now = self.robot.is_gripping()
+        if gripping_now and not self._prev_gripping and not self._grasp_claimed:
             r["grasp"] = self._grasp_reward()
+            self._grasp_claimed = True
+        self._prev_gripping = gripping_now
+        if not gripping_now:
+            r["reach"] = self._reach_cube_reward()
         else:
             r["lift"] = self._lift_reward()
+            r["hold"] = HOLD_INCOME  # firm grip income; makes gripping net-positive
             if not self._is_cube_centralized_wrt_tray():
                 r["approach"] = self._approach_tray_reward()
             else:
                 r["lower"] = self._lower_into_tray_reward()
                 r["success"], self.success_status = self._success_reward()
         self.step_rewards = r
-        return sum(r.values()) - 0.001
+        floor_penalty = max(0.0, 5.0 * (0.02 - self.robot.get_end_effector_pos()[2]))
+        return sum(r.values()) - 0.01 - floor_penalty
 
     def _reach_cube_reward(self):
         current_distance = self._get_distance_from_cube()
@@ -114,12 +145,19 @@ class TidyEnv:
         ):  # this is for the first step after reset only
             self._old_distance_from_cube = current_distance
             return 0
-        reward = self._old_distance_from_cube - current_distance
+        reward = (self._old_distance_from_cube - current_distance) * 10
+        z = self.robot.get_end_effector_pos()[2]
+        ee = self.robot.get_end_effector_pos()
+        cube = self.small_cube.get_current_pos()
+        aligned = abs(ee[0] - cube[0]) < 0.03 and abs(ee[1] - cube[1]) < 0.03
+        if not self._band_bonus_claimed and aligned and 0.02 <= z <= 0.04:
+            self._band_bonus_claimed = True
+            reward += 0.5  # one-shot: reached the grasp band
         self._old_distance_from_cube = current_distance
         return reward
 
     def _grasp_reward(self):
-        return 1 if self.robot.is_gripping() else 0
+        return 3 if self.robot.is_gripping() else 0
 
     def _lift_reward(self):
         if self.robot.is_gripping():
@@ -143,7 +181,7 @@ class TidyEnv:
         if self._old_cube_distance_from_tray is None:
             self._old_cube_distance_from_tray = current_distance
             return 0
-        reward = self._old_cube_distance_from_tray - current_distance
+        reward = (self._old_cube_distance_from_tray - current_distance) * 10
         self._old_cube_distance_from_tray = current_distance
         return reward
 
@@ -187,10 +225,9 @@ class TidyEnv:
         )
 
     def _get_distance_from_cube(self):
-        return np.linalg.norm(
-            np.array(self.robot.get_end_effector_pos())
-            - np.array(self.small_cube.get_current_pos())
-        )
+        cube = np.array(self.small_cube.get_current_pos())
+        grasp_target = cube  # EE is the finger frame; grip happens at cube center
+        return np.linalg.norm(np.array(self.robot.get_end_effector_pos()) - grasp_target)
 
     def _clip_target_position(self, target_position):
         return np.clip(target_position, self.workspace_low, self.workspace_high)
@@ -207,8 +244,8 @@ class TidyEnv:
 
     def _get_cube_distance_from_tray(self):
         return np.linalg.norm(
-            np.array(self.small_cube.get_current_pos())
-            - np.array(self.tray.get_current_pos())
+            np.array(self.small_cube.get_current_pos())[:2]
+            - np.array(self.tray.get_current_pos())[:2]
         )
 
     def _is_cube_centralized_wrt_tray(self):

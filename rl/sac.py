@@ -20,8 +20,8 @@ class SAC:
             list(self.critic1.parameters()) + list(self.critic2.parameters()), lr=3e-4
         )
 
-        self.alpha = 0.2
-        self.gamma = 0.99
+        self.alpha = 0.1
+        self.gamma = 0.95
         self.tau = 0.005
 
     def select_action(self, state):
@@ -47,15 +47,13 @@ class SAC:
 
     def _update_critics(self, states, actions, rewards, next_states, dones):
         with torch.no_grad():
-            next_actions, log_prob = self.actor.sample(next_states)
+            next_actions, _ = self.actor.sample(next_states)
 
             target_q1 = self.target_critic1.forward(next_states, next_actions)
             target_q2 = self.target_critic2.forward(next_states, next_actions)
 
             target_q = torch.min(target_q1, target_q2)
-            target = rewards + self.gamma * (1 - dones) * (
-                target_q - self.alpha * log_prob
-            )
+            target = rewards + self.gamma * (1 - dones) * target_q
         current_q1 = self.critic1.forward(states, actions)
         current_q2 = self.critic2.forward(states, actions)
 

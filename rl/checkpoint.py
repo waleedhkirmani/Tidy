@@ -1,7 +1,7 @@
 import os
 import torch
 
-DEFAULT_PATH = os.path.join("models", "latest_sac.pt")
+DEFAULT_PATH = os.path.join("models", "b_model_latest.pt")
 
 
 def save_checkpoint(agent, episode, path=DEFAULT_PATH):

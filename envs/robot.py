@@ -1,4 +1,5 @@
 import pybullet as p
+import numpy as np
 import math
 
 
@@ -56,13 +57,16 @@ class Robot:
         if self.cube_id is None:
             return False
         contact_points = p.getContactPoints(bodyA=self.id, bodyB=self.cube_id)
-        left_finger_touching = any(contact[3] == 9 for contact in contact_points)
-        right_finger_touching = any(contact[3] == 10 for contact in contact_points)
-        return left_finger_touching and right_finger_touching and self.gripper_closed
+        contacts = {c[3]: c for c in contact_points if c[3] in (9, 10)}
+        if 9 not in contacts or 10 not in contacts or not self.gripper_closed:
+            return False
+        # A real clamp: the fingers press opposite faces of the cube, so the
+        # cube-surface contact normals are opposed. Closed fingers merely
+        # touching (pushing the top or a side) yield same/adjacent normals.
+        n1, n2 = np.array(contacts[9][7]), np.array(contacts[10][7])
+        return float(np.dot(n1, n2)) < -0.5
 
     def open_claw(self, f=200, target_position=0.04):
-        if not self.gripper_closed:
-            return
         for joint in [9, 10]:
             p.setJointMotorControl2(
                 bodyUniqueId=self.id,

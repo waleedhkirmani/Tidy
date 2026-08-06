@@ -47,3 +47,23 @@ Reward Design:
   Approach tray reward just rewarded getting closer to the tray
   Lower into tray reward meant that the cube is in the air right above the tray, and we just need to descent it. It rewarded decrease in height. 
   And it also rewarded staying centred with respect to the tray. It punished opening the gripper
+
+Training Loops:
+  Designed the training loops. First found out the rewards to approach were too low so the policy didnt make 
+  any bold moves. increased it and now the policy reached floor and never escaped from there
+  Then I added a penalty for being too close to floor and now arm found something else to violate. In the air
+  The actor now fears descending. It learned that descending hurts it because of stiff penalty so now its 
+  not worth the risk. Reduced gamma a bit and halfed alpha. Now atleast the agent is not settling for mediocre.
+  The cube stopped above the cube because it thought that descending is worse than staying. Now we are giving
+  it a one time reward when it comes into graspable height. 
+  Removing the entropy term from the critic loss. Before coming to cube was 4 in rewards. But that was not due
+  to results of an action, that was just a constant added. And descending further was not that much greater so
+  the policy didnt bother. Now descend near cube will be 0.2 or 0.3 and it will make a big curve to improve
+  The critic calibrated but it still was not descending to the band. Because most cases were overshoot into penalties
+  and the grasp was too rare to make a change. Now adding an income to be inside the band length so the arm stays 
+  there and eventually, it will grasp and get the +1 reward
+  It just hacked the reward and stayed idle above the cube again.
+  There was a bug with the end pointers in is_gripping and that caused all that issues.
+  After 600 iterations, i got the claw almost always touching and sometimes even gripping the cube. There was an 
+  issue in is_grasping, it fired on any contact between the fingers and the cube. So now updating it to calculate
+  the distance between fingers as well.
