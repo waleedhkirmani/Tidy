@@ -1,12 +1,25 @@
 # %%
 
+import argparse
+import os
 import time
 from collections import deque
 
-from rl.checkpoint import load_checkpoint, save_checkpoint
+from rl.checkpoint import MODELS_DIR, load_checkpoint, save_checkpoint
 from rl.sac import SAC
 from rl.replay_buffer import ReplayBuffer
 from envs.tidy_env import TidyEnv
+
+# %%
+
+parser = argparse.ArgumentParser()
+parser.add_argument(
+    "--minutes",
+    type=float,
+    default=None,
+    help="Wall-clock budget in minutes; stop cleanly after this (cloud sessions)",
+)
+args = parser.parse_args()
 
 # %%
 
@@ -27,7 +40,11 @@ start_episode = load_checkpoint(sac)
 j = 0
 best_reward = -1e9
 recent = deque(maxlen=10)
+t_start = time.time()
 for i in range(start_episode, start_episode + episode_len):
+    if args.minutes and time.time() - t_start > args.minutes * 60:
+        print(f"Time budget ({args.minutes:.0f} min) hit after episode {j}; saving and stopping")
+        break
     state, info = env.reset()
     ep_start = time.time()
     done = False
@@ -58,7 +75,7 @@ for i in range(start_episode, start_episode + episode_len):
     avg = sum(recent) / len(recent)
     if avg > best_reward:
         best_reward = avg
-        save_checkpoint(sac, i, path="models/b_best.pt")
+        save_checkpoint(sac, i, path=os.path.join(MODELS_DIR, "b_best.pt"))
     if i % 100 == 0:
         save_checkpoint(sac, i)
     j = i
