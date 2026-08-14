@@ -19,16 +19,24 @@ parser.add_argument(
     default=None,
     help="Wall-clock budget in minutes; stop cleanly after this (cloud sessions)",
 )
+parser.add_argument(
+    "--episodes",
+    type=int,
+    default=200,
+    help="Episodes to run this session (resumes from checkpoint)",
+)
 args = parser.parse_args()
 
 # %%
 
-episode_len = 3000
+episode_len = args.episodes
 batch_size = 64
+RAMP_EPISODES = 2000  # spread reaches full randomization after this many episodes
+KEYS = ["reach", "grasp", "lift", "hold", "approach", "lower", "success"]
 
 # %%
 
-env = TidyEnv(gui=False)
+env = TidyEnv(gui=False, randomize_cube_spawn=True)
 sac = SAC()
 replay_buffer = ReplayBuffer()
 
@@ -43,12 +51,16 @@ recent = deque(maxlen=10)
 t_start = time.time()
 for i in range(start_episode, start_episode + episode_len):
     if args.minutes and time.time() - t_start > args.minutes * 60:
-        print(f"Time budget ({args.minutes:.0f} min) hit after episode {j}; saving and stopping")
+        print(
+            f"Time budget ({args.minutes:.0f} min) hit after episode {j}; saving and stopping"
+        )
         break
+    # env.set_cube_spawn_spread(min(1.0, (i - start_episode) / RAMP_EPISODES))
     state, info = env.reset()
     ep_start = time.time()
     done = False
     ep_reward = 0
+    comps = dict.fromkeys(KEYS, 0.0)
     while not done:
         # Select Action
         action = sac.select_action(state)
@@ -59,6 +71,8 @@ for i in range(start_episode, start_episode + episode_len):
 
         done = terminated or truncated
         ep_reward += reward
+        for k in KEYS:
+            comps[k] += info["rewards"][k]
 
         # Save episode
         replay_buffer.add(state, action, reward, next_state, terminated)
@@ -70,6 +84,8 @@ for i in range(start_episode, start_episode + episode_len):
 
     print(
         f"Episode {i:4d} | Reward: {ep_reward:8.2f} | Buffer: {len(replay_buffer.buffer)} | Time: {time.time() - ep_start:5.1f}s"
+        + "".join(f" | {k}={comps[k]:.2f}" for k in KEYS),
+        flush=True,
     )
     recent.append(ep_reward)
     avg = sum(recent) / len(recent)

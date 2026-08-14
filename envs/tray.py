@@ -16,5 +16,14 @@ class Tray:
         self.half_width = (aabb_max[1] - aabb_min[1]) / 2
         self.top = aabb_max[2]
 
+        # true geometric center of the mesh, NOT the URDF link origin —
+        # those two only coincide if the mesh is authored symmetrically
+        z = p.getBasePositionAndOrientation(self.id)[0][2]
+        self._center = (
+            (aabb_min[0] + aabb_max[0]) / 2,
+            (aabb_min[1] + aabb_max[1]) / 2,
+            z,
+        )
+
     def get_current_pos(self):
-        return p.getBasePositionAndOrientation(self.id)[0]
+        return self._center

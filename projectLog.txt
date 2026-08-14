@@ -67,3 +67,25 @@ Training Loops:
   After 600 iterations, i got the claw almost always touching and sometimes even gripping the cube. There was an 
   issue in is_grasping, it fired on any contact between the fingers and the cube. So now updating it to calculate
   the distance between fingers as well.
+  Ran 3000 fresh iterations. Still the same issue. The issue was that when the actor told the fingers to close,
+  it also gave new x and y, so it made the claw move, making a grasp impossible. So i fixed it by lowering the effect
+  of lateral movement when a close is ordered. Ran 500 more iterations, Now the robot picks up the cube, and takes it
+  on top of the tray. But there were two issues in the lower_reward. One, the centralizing reward was too big, so it 
+  kept farming it. Two, the descent reward never triggered, because a value was reset by another function
+  I lowered the farmed reward and fixed the issues and also added a comparison between the all time low height
+  and the current height to give the reward, so that the robot does not farm reward by oscillation
+  Trained for 300 more iterations. Still hovering. Cutted down on some rewards like holding and centralized cube
+  Also removed the penalty of opening the claw when lowering. Also added a condition to give success only when
+  the distance of robot arm is less than 0.15. One bug which might have been the cause of it, was that 
+  success reward was inside is_gripping. Which isnt possible
+  Trained to 4100. The only thing left is fixing some issue in lower_cube reward
+  Found the issue! The lower reward and the lift reward were active at the same time. Cancelling each other
+  So the robot stayed upright.
+  The robot descended, but dropped the cube besides the tray. So i raised the centralizing reward from 0.001 to 0.02.
+  A 20x increase, which caused the arm to hover again. Now I tuned it back to 0.005.
+  Just discovered there was a bug in tray.py. The center calculator for tray had some potential issue. That explains
+  why everything was working but the arm was just dropping the robot just besides the tray. The RL was perfect here,
+  environment design got me.
+  Works! The final issue was that the fingers went further down than the band within which closing fingers was allowed
+  Now adding randomness to the cube spawn
+

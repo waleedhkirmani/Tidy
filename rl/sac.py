@@ -21,7 +21,7 @@ class SAC:
         )
 
         self.alpha = 0.1
-        self.gamma = 0.95
+        self.gamma = 0.99
         self.tau = 0.005
 
     def select_action(self, state):
