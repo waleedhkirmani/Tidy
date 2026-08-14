@@ -3,5 +3,5 @@
 # into ./models for local eval. Run `rclone config` once to auth Drive.
 set -euo pipefail
 
-rclone sync drive:Tidy/models models/
-echo "Checkpoints synced to models/"
+rclone copy drive:Tidy/models models/
+echo "Checkpoints pulled to models/"
