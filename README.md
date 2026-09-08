@@ -18,7 +18,7 @@ Trained entirely on CPU (no local GPU), with cloud offload to Colab for the actu
 
 ## Results
 
-- **100% success rate on fixed spawns** as of episode 4798 (`b_best_4798_fixed_spawn_100pct_working.pt`) — cube and tray at fixed positions, arm reliably reaches, grasps, lifts, carries, and lowers the cube into the tray.
+- **100% success rate on fixed spawns** as of episode 4798 (`b_best_4798_fixed_spawn_100pct_working.pt`) — cube and tray at fixed positions, arm reliably reaches, grasps, lifts, carries, and lowers the cube into the tray. The model is present in releases.
 - **Random-spawn generalization is the active frontier** — spawn randomization within a configurable spread was just added; this is the current training target.
 
 ## How it works
