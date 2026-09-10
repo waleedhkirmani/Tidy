@@ -7,7 +7,7 @@ from rl.checkpoint import load_checkpoint
 from rl.sac import SAC
 from envs.tidy_env import TidyEnv
 
-env = TidyEnv(gui=True, randomize_cube_spawn=True)
+env = TidyEnv(gui=True, randomize_cube_spawn=False)
 sac = SAC()
 
 cam = {"dist": 1.7, "yaw": 90.0, "pitch": -35.0, "target": np.array([0.5, 0.0, 0.2])}
@@ -39,9 +39,9 @@ def move_camera():
     p.resetDebugVisualizerCamera(cam["dist"], cam["yaw"], cam["pitch"], cam["target"])
 
 
-# start = load_checkpoint(sac, path="models/b_best_fixed_spawn.pt")
+start = load_checkpoint(sac, path="models/b_best_4798_fixed_spawn_100pct_working.pt")
 # start = load_checkpoint(sac, path="models/b_best.pt") or load_checkpoint(sac)
-start = load_checkpoint(sac)
+# start = load_checkpoint(sac)
 if start == 0:
     print("WARNING: no checkpoint found, evaluating an untrained policy")
 else:
