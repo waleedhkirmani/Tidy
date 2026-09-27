@@ -27,7 +27,7 @@ class TidyEnv:
     ):
         self.randomize_cube_spawn = randomize_cube_spawn
         self.randomize_tray_spawn = randomize_tray_spawn
-        self.cube_spawn_spread = 0.1  # 0 = trained anchor, 1 = full range
+        self.cube_spawn_spread = 1.0  # 0 = trained anchor, 1 = full range
 
         # RL
         self.action_space = spaces.Box(
@@ -35,8 +35,11 @@ class TidyEnv:
             high=np.array([0.05, 0.05, 0.05, 1], dtype=np.float32),
             dtype=np.float32,
         )
+        # [ee_xyz(3), cube_xyz(3), tray_xyz(3), fingers(2), gripping(1),
+        #  cube-ee(3), ee_vel(3)] — everything the reward branches on is in the
+        # observation, so the critic sees the real state, not a projection.
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(9,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(18,), dtype=np.float32
         )
 
         # Environment
@@ -87,58 +90,52 @@ class TidyEnv:
                 self._advance_toward([cx, cy, z])
         for _ in range(40):
             p.stepSimulation()
-        self._previous_cube_height = None
-        self._old_distance_from_cube = None
-        self._band_bonus_claimed = False
-        self._close_executed = False
-        self._old_cube_distance_from_tray = None
-        self._prev_gripping = False
-        self._grasp_claimed = False
-        self._tray_min_cube_height = None  # monotone-min descent tracker
-        self._old_center_distance = None  # center-gradient tracker
-        self._old_band_dist = None  # band-center gradient tracker
         self.success_status = False
-        self._start_landing = False
         self.step_count = 0
 
         info = {}
 
-        return self._get_obs(), info
+        obs = self._get_obs()
+        self._prev_obs = obs
+        return obs, info
 
     def step(self, action):
 
         self.step_count += 1
 
-        # The action would be delta x, delta y, delta z, and gripper 0/1
-        if action[3] <= 0.5 and not self.robot.gripper_closed:
+        # Movement is always driven by action[:3]; the gripper channel only
+        # decides open/close, so a close intent can never discard the actor's
+        # xyz output and snap-vertical (the old whiplash source near 0.5).
+        target_position = self._calculate_target_position(
+            action[:3], self.robot.get_end_effector_pos()
+        )
+        target_position = self._clip_target_position(target_position)
+        self._advance_toward(target_position)
+
+        if action[3] > 0.5:
+            self.robot.open_claw()
+        elif self._in_grasp_window() and not self.robot.gripper_closed:
             # Gated like a gripper controller refusing a misaligned close:
             # in the window -> pure close (moving + closing in one step never
-            # clamps); outside the window -> wait in place with the claw open,
-            # so a premature close can't waste a step and force a slow reopen.
-            if self._in_grasp_window():
-                self.robot.close_claw()
-                self._close_executed = True
-        else:
-            target_position = self._calculate_target_position(
-                action[:3], self.robot.get_end_effector_pos()
-            )
-            target_position = self._clip_target_position(target_position)
-            self._advance_toward(target_position)
+            # clamps); outside the window -> just keep moving, don't close.
+            self.robot.close_claw()
 
-            if action[3] > 0.5:
-                self.robot.open_claw()
-            else:
-                self.robot.close_claw()
-
-        reward = self._calculate_reward()
+        obs = self._get_obs()
+        reward = self._calculate_reward(self._prev_obs, obs, action)
+        self._prev_obs = obs
         terminated = self.success_status
         truncated = self.step_count >= self.max_episode_steps
         info = {"rewards": self.step_rewards}
-        return (self._get_obs(), reward, terminated, truncated, info)
+        return (obs, reward, terminated, truncated, info)
 
-    def _calculate_reward(self):
-        prev_band_dist = self._old_band_dist
-        self._old_band_dist = abs(self.robot.get_end_effector_pos()[2] - 0.03)
+    def _calculate_reward(self, prev_obs, obs, action):
+        # Stateless: every term is a function of (s, a, s') -- the previous
+        # observation, the current action, and the current observation. No
+        # one-shot flags, no monotone-min trackers; gradients are potential
+        # differences that telescope, so bouncing can't farm them.
+        ee, cube, tray = obs[0:3], obs[3:6], obs[6:9]
+        ee_prev, cube_prev = prev_obs[0:3], prev_obs[3:6]
+        gripping = bool(obs[11])
         r = {
             "reach": 0,
             "grasp": 0,
@@ -148,59 +145,88 @@ class TidyEnv:
             "lower": 0,
             "success": 0,
         }
-        gripping_now = self.robot.is_gripping()
-        if gripping_now and not self._prev_gripping and not self._grasp_claimed:
-            r["grasp"] = self._grasp_reward()
-            self._grasp_claimed = True
-        if self._close_executed:
-            r["grasp"] += 1.0  # one-shot: executed the close inside the grasp band
-        self._close_executed = False
-        self._prev_gripping = gripping_now
-        if not gripping_now:
-            r["reach"] = self._reach_cube_reward()
-            if self._in_grasp_window():
-                r["reach"] += 0.1  # window income: last-cm gradient into the grasp band
-            # descent-into-window: a claw-open descent over the cube pays, so a
-            # far spawn hovering just above the band gets a gradient to drop in
-            if not self.robot.gripper_closed:
-                ee = self.robot.get_end_effector_pos()
-                cube = self.small_cube.get_current_pos()
-                aligned = abs(ee[0] - cube[0]) < 0.04 and abs(ee[1] - cube[1]) < 0.04
-                band_dist = abs(ee[2] - 0.03)
-                if aligned and prev_band_dist is not None:
-                    # ponytail: gradient to the band center — descending above
-                    # the band pays, overshooting below it pays negative, so
-                    # the EE parks in the window where the close can fire
-                    r["reach"] += (prev_band_dist - band_dist) * 10
+        # grasp onset: transition into a real clamp pays once, and a genuine
+        # re-grasp after a drop pays again -- honest, observable in (s, s').
+        if gripping and not bool(prev_obs[11]):
+            r["grasp"] = 10.0
+        # close bonus: a close intent fired inside the grasp band while the
+        # claw was open. The claw-open bit is read from the PREVIOUS obs, so
+        # "already closed" and "just closed" disambiguate from (s, a, s').
+        if action[3] <= 0.5 and self._in_grasp_window_obs(obs) and not self._fingers_closed(
+            prev_obs
+        ):
+            r["grasp"] += 1.0
+
+        if not gripping:
+            # potential: reach = -13 * ||cube - ee||; telescopes, backing off
+            # pays negative, so in/out hunting collects nothing extra.
+            r["reach"] = (
+                13
+                * (np.linalg.norm(cube_prev - ee_prev) - np.linalg.norm(cube - ee))
+            )
+            if self._in_grasp_window_obs(obs):
+                r["reach"] += 0.1  # window income: parks the EE where close can fire
         else:
-            if not self._start_landing:
-                r["lift"] = self._lift_reward()
             r["hold"] = HOLD_INCOME  # firm grip income; makes gripping net-positive
-            if not self._is_cube_centralized_wrt_tray():
-                r["approach"] = self._approach_tray_reward()
+            if not self._is_cube_centralized_obs(obs):
+                if cube[2] <= 0.75:
+                    r["lift"] = 5 * (cube[2] - cube_prev[2])  # lift pays like carry
+                r["approach"] = 10 * (
+                    self._xy_dist(cube_prev, tray) - self._xy_dist(cube, tray)
+                )
+                # ponytail: approach pays only once the cube is lifted above
+                # the tray rim (0.25 = ~20cm clearance); carrying low clips the
+                # rim and is the "into the side of the tray" failure.
+                if cube[2] < 0.25:
+                    r["approach"] *= 0.5
             else:
-                if not self._start_landing:
-                    self._start_landing = True
-                r["lower"] = self._lower_into_tray_reward()
-        if self._get_cube_distance_from_tray() < 0.15:
-            r["success"], self.success_status = self._success_reward()
+                lower = 0.005  # staying centralized wrt the tray
+                if not self._is_cube_in_tray_obs(obs):
+                    # potential: descent = -13 * cube_z, center = -10 * xy_dist;
+                    # both telescope, so drop/rise oscillation can't re-farm.
+                    lower += 13 * (cube_prev[2] - cube[2])
+                    lower += 10 * (
+                        self._xy_dist(cube_prev, tray) - self._xy_dist(cube, tray)
+                    )
+                r["lower"] = lower
+        if self._xy_dist(cube, tray) < 0.15:
+            fingers_low = ee[2] < self.tray.top + 0.02
+            if self._is_cube_in_tray_obs(obs) and fingers_low:
+                r["success"] = 50.0
+                self.success_status = True
         self.step_rewards = r
-        floor_penalty = max(0.0, 5.0 * (0.02 - self.robot.get_end_effector_pos()[2]))
+        floor_penalty = max(0.0, 5.0 * (0.02 - ee[2]))
         return sum(r.values()) - 0.01 - floor_penalty
 
-    def _reach_cube_reward(self):
-        current_distance = self._get_distance_from_cube()
-        if (
-            self._old_distance_from_cube is None
-        ):  # this is for the first step after reset only
-            self._old_distance_from_cube = current_distance
-            return 0
-        reward = (self._old_distance_from_cube - current_distance) * 10
-        if not self._band_bonus_claimed and self._in_grasp_window():
-            self._band_bonus_claimed = True
-            reward += 0.5  # one-shot: reached the grasp band
-        self._old_distance_from_cube = current_distance
-        return reward
+    @staticmethod
+    def _fingers_closed(obs):
+        return bool(obs[9] < 0.01 and obs[10] < 0.01)
+
+    @staticmethod
+    def _xy_dist(cube, tray):
+        return np.linalg.norm((cube - tray)[:2])
+
+    def _in_grasp_window_obs(self, obs):
+        ee, cube = obs[0:3], obs[3:6]
+        aligned = abs(ee[0] - cube[0]) < 0.03 and abs(ee[1] - cube[1]) < 0.03
+        # ponytail: z-bottom widened (0.02 -> 0.005) so a far spawn that dives
+        # just below the old band (EE ~0.013, aligned, close intent) can close
+        return aligned and 0.005 <= ee[2] <= 0.04
+
+    def _is_cube_centralized_obs(self, obs):
+        cube, tray = obs[3:6], obs[6:9]
+        return (
+            abs(cube[0] - tray[0]) < self.tray.half_length
+            and abs(cube[1] - tray[1]) < self.tray.half_width
+        )
+
+    def _is_cube_in_tray_obs(self, obs):
+        # ponytail: +0.01 margin — the funnel-shaped tray wedges the hand with
+        # the cube ~0.5mm above the rim; the cube is seated in the tray mouth.
+        return (
+            self._is_cube_centralized_obs(obs)
+            and obs[5] < self.tray.top + 0.01
+        )
 
     def _in_grasp_window(self):
         ee = self.robot.get_end_effector_pos()
@@ -209,77 +235,6 @@ class TidyEnv:
         # ponytail: z-bottom widened (0.02 -> 0.005) so a far spawn that dives
         # just below the old band (EE ~0.013, aligned, close intent) can close
         return aligned and 0.005 <= ee[2] <= 0.04
-
-    def _grasp_reward(self):
-        return 3 if self.robot.is_gripping() else 0
-
-    def _lift_reward(self):
-        if self.robot.is_gripping():
-            current_height = self.small_cube.get_current_pos()[2]
-
-            if self._previous_cube_height is None:
-                self._previous_cube_height = self.small_cube.get_current_pos()[2]
-            height_diff = current_height - self._previous_cube_height
-            self._previous_cube_height = current_height
-            if current_height > 0.75:
-                self._previous_cube_height = current_height
-                return 0
-            return height_diff * 5  # lift pays like carry
-        else:
-            return 0
-
-    def _approach_tray_reward(
-        self,
-    ):  # TODO: Maybe add a feature where it does not count z at all
-        current_distance = self._get_cube_distance_from_tray()
-        if self._old_cube_distance_from_tray is None:
-            self._old_cube_distance_from_tray = current_distance
-            return 0
-        reward = (self._old_cube_distance_from_tray - current_distance) * 10
-        self._old_cube_distance_from_tray = current_distance
-        # ponytail: approach pays only once the cube is lifted above the tray
-        # rim (0.25 = ~20cm clearance); carrying low clips the rim and is the
-        # "into the side of the tray" failure.
-        if self.small_cube.get_current_pos()[2] < 0.25:
-            return reward / 2
-        return reward
-
-    def _lower_into_tray_reward(self):
-        # Reward staying centralized wrt to the tray
-        if self._is_cube_centralized_wrt_tray():
-            reward = 0.005
-        else:
-            reward = 0
-
-        if self.robot.gripper_closed and not self._is_cube_in_tray():
-            current_height = self.small_cube.get_current_pos()[2]
-            if self._tray_min_cube_height is None:
-                self._tray_min_cube_height = current_height
-            elif current_height < self._tray_min_cube_height:
-                # ponytail: monotone-min — the full drop credits once; raising
-                # never resets, so up/down oscillation can't re-farm the descent
-                reward += (self._tray_min_cube_height - current_height) * 13
-                self._tray_min_cube_height = current_height
-            # ponytail: continuous center-gradient — approach switches off once
-            # the cube enters the tray footprint, so pull toward the mouth
-            # center while descending instead of dropping off-center
-            center_dist = self._get_cube_distance_from_tray()
-            if self._old_center_distance is None:
-                self._old_center_distance = center_dist
-            else:
-                reward += (self._old_center_distance - center_dist) * 10
-                self._old_center_distance = center_dist
-        # if not self.robot.gripper_closed:
-        # reward -= 1
-        return reward
-
-    def _success_reward(self):
-        reward = 0
-        fingers_low = self.robot.get_end_effector_pos()[2] < self.tray.top + 0.02
-        if self._is_cube_in_tray() and fingers_low:
-            reward += 50
-            return reward, True
-        return 0, False
 
     def _setup_physics(self):
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
@@ -294,39 +249,31 @@ class TidyEnv:
             cameraTargetPosition=[0.5, 0.0, 0.2],
         )
 
-    def _get_distance_from_cube(self):
-        cube = np.array(self.small_cube.get_current_pos())
-        grasp_target = cube  # EE is the finger frame; grip happens at cube center
-        return np.linalg.norm(
-            np.array(self.robot.get_end_effector_pos()) - grasp_target
-        )
-
     def _clip_target_position(self, target_position):
         return np.clip(target_position, self.workspace_low, self.workspace_high)
 
     def _get_obs(self):
-        return np.array(
-            [
-                *self.robot.get_end_effector_pos(),
-                *self.small_cube.get_current_pos(),
-                *self.tray.get_current_pos(),
-            ],
+        ee = np.array(self.robot.get_end_effector_pos(), dtype=np.float32)
+        cube = np.array(self.small_cube.get_current_pos(), dtype=np.float32)
+        tray = np.array(self.tray.get_current_pos(), dtype=np.float32)
+        fingers = np.array(
+            [p.getJointState(self.robot.id, 9)[0], p.getJointState(self.robot.id, 10)[0]],
             dtype=np.float32,
         )
-
-    def _get_cube_distance_from_tray(self):
-        return np.linalg.norm(
-            np.array(self.small_cube.get_current_pos())[:2]
-            - np.array(self.tray.get_current_pos())[:2]
+        ee_vel = np.array(
+            p.getLinkState(self.robot.id, 11, computeLinkVelocity=1)[6], dtype=np.float32
         )
-
-    def _is_cube_centralized_wrt_tray(self):
-        cube_pos = self.small_cube.get_current_pos()
-        tray_pos = self.tray.get_current_pos()
-        return (
-            abs(cube_pos[0] - tray_pos[0]) < self.tray.half_length
-            and abs(cube_pos[1] - tray_pos[1]) < self.tray.half_width
-        )
+        return np.concatenate(
+            [
+                ee,
+                cube,
+                tray,
+                fingers,
+                [float(self.robot.is_gripping())],
+                cube - ee,
+                ee_vel,
+            ]
+        ).astype(np.float32)
 
     def set_cube_spawn_spread(self, fraction):
         self.cube_spawn_spread = fraction
@@ -360,14 +307,6 @@ class TidyEnv:
         self.tray = Tray(basePos, globScale)
 
         return self.tray
-
-    def _is_cube_in_tray(self):
-        # ponytail: +0.01 margin — the funnel-shaped tray wedges the hand with
-        # the cube ~0.5mm above the rim; the cube is seated in the tray mouth.
-        return (
-            self._is_cube_centralized_wrt_tray()
-            and self.small_cube.get_current_pos()[2] < self.tray.top + 0.01
-        )
 
     def check_ik_reachability(self, target_position, target_orientation):
         saved = [p.getJointState(self.robot.id, i)[0] for i in range(7)]

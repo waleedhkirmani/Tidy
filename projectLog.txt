@@ -70,7 +70,7 @@ Training Loops:
   Ran 3000 fresh iterations. Still the same issue. The issue was that when the actor told the fingers to close,
   it also gave new x and y, so it made the claw move, making a grasp impossible. So i fixed it by lowering the effect
   of lateral movement when a close is ordered. Ran 500 more iterations, Now the robot picks up the cube, and takes it
-  on top of the tray. But there were two issues in the lower_reward. One, the centralizing reward was too big, so it 
+  on top of the tray. But there were two issues in the lower_reward. One, the centralizing reward was too big, so it
   kept farming it. Two, the descent reward never triggered, because a value was reset by another function
   I lowered the farmed reward and fixed the issues and also added a comparison between the all time low height
   and the current height to give the reward, so that the robot does not farm reward by oscillation
@@ -88,4 +88,18 @@ Training Loops:
   environment design got me.
   Works! The final issue was that the fingers went further down than the band within which closing fingers was allowed
   Now adding randomness to the cube spawn
-
+  Have been trying to generalize it since like last week or two. Haven't even solved grasp yet. Tried some things
+  but they didn't work.
+  Well, for quite some time now, the robot was showing grasps during training, but it kept on leaving the cube 
+  afterwards. It didn't even grasp in the deterministic policy that I tested. Kept training, for quite some time.
+  Reduced alpha to 0.05 for it to exploit it going on top of the cube so that it can solidify its grip. It is now
+  gripping, but not lifting. Now I'll increase the alpha back to 1 or 2 so that it can explore that lifting is good.
+  Well. There was an issue where the gripping reward got inflated. Just fixed it and now I'll retrain
+  The gripping is fixed but i just discovered an issue with reach. The robot hacks it by hovering up and down
+  The generalization has started to work a BIT. Though the arm is not moving smooth. It has sudden violent jerks
+  It were some reward related bugs, fixed them and started from 0.
+  During development, I added new factors to the environment which were not part of the obs. This violates the
+  Markov property. Secondly, reward was a function of episode history, not of (s, a, s'). Some of the non-Markov
+  properties were introduced by me to stop the robot from reward hacking.
+  Now there are 18 instead of 9 in the observation.
+  I made the alpha for entropy learnable. It exploded during the first run due to a sign issue in the formula, fixed it

@@ -25,6 +25,12 @@ parser.add_argument(
     default=200,
     help="Episodes to run this session (resumes from checkpoint)",
 )
+parser.add_argument(
+    "--alpha",
+    type=float,
+    default=0.2,
+    help="Initial SAC temperature; learnable from the first update (auto entropy tuning)",
+)
 args = parser.parse_args()
 
 # %%
@@ -37,7 +43,7 @@ KEYS = ["reach", "grasp", "lift", "hold", "approach", "lower", "success"]
 # %%
 
 env = TidyEnv(gui=False, randomize_cube_spawn=True)
-sac = SAC()
+sac = SAC(alpha=args.alpha)
 replay_buffer = ReplayBuffer()
 
 # %%
@@ -84,6 +90,7 @@ for i in range(start_episode, start_episode + episode_len):
 
     print(
         f"Episode {i:4d} | Reward: {ep_reward:8.2f} | Buffer: {len(replay_buffer.buffer)} | Time: {time.time() - ep_start:5.1f}s"
+        + f" | alpha={sac.log_alpha.exp().item():.4f}"
         + "".join(f" | {k}={comps[k]:.2f}" for k in KEYS),
         flush=True,
     )

@@ -6,7 +6,7 @@ class Actor(nn.Module):
     def __init__(self):
         super().__init__()
         self.actor = nn.Sequential(
-            nn.Linear(9, 64), nn.Tanh(), nn.Linear(64, 64), nn.Tanh(), nn.Linear(64, 8)
+            nn.Linear(18, 64), nn.Tanh(), nn.Linear(64, 64), nn.Tanh(), nn.Linear(64, 8)
         )
 
     def forward(self, state):
@@ -42,7 +42,7 @@ class Critic(nn.Module):
     def __init__(self):
         super().__init__()
         self.critic = nn.Sequential(
-            nn.Linear(13, 64), nn.Tanh(), nn.Linear(64, 64), nn.Tanh(), nn.Linear(64, 1)
+            nn.Linear(22, 64), nn.Tanh(), nn.Linear(64, 64), nn.Tanh(), nn.Linear(64, 1)
         )
 
     def forward(self, state, action):
