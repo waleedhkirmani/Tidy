@@ -2,12 +2,15 @@
 
 import argparse
 import os
+import sys
 from statistics import mean
 import numpy as np
 import pybullet as p
+import torch
 from rl.checkpoint import DEFAULT_PATH, MODELS_DIR, load_checkpoint
 from rl.sac import SAC
-from envs.tidy_env import TidyEnv
+from stable_baselines3 import SAC as SB3SAC
+from envs.tidy_env import TidyEnv, ramp_curriculum_prob, ramp_spread
 
 parser = argparse.ArgumentParser()
 parser.add_argument(
@@ -16,17 +19,45 @@ parser.add_argument(
     default="latest",
     help="Which checkpoint to load: latest (b_model_latest.pt) or best (b_best.pt)",
 )
+parser.add_argument(
+    "--sb3",
+    default=None,
+    help="Evaluate a Stable-Baselines3 SAC .zip instead of a hand-rolled checkpoint",
+)
+parser.add_argument(
+    "--curriculum",
+    type=float,
+    default=None,
+    help="Fraction of probe episodes; overrides the value derived from the checkpoint episode",
+)
+parser.add_argument(
+    "--probe",
+    choices=["grasp", "place"],
+    default="grasp",
+    help="Curriculum probe type: grasp (start above the cube) or place (start "
+    "above the tray, cube in hand; fires at HALF the grasp probability)",
+)
+parser.add_argument(
+    "--randomize-spawn",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="Randomize the cube spawn (default). Use --no-randomize-spawn for a model trained on fixed spawns",
+)
 args = parser.parse_args()
 
-env = TidyEnv(gui=True, randomize_cube_spawn=True)
-sac = SAC()
+env = TidyEnv(
+    gui=True,
+    randomize_cube_spawn=args.randomize_spawn,
+    randomize_tray_spawn=args.randomize_spawn,
+    curriculum_prob=args.curriculum,
+    probe=args.probe,
+)
 
 cam = {"dist": 1.7, "yaw": 90.0, "pitch": -35.0, "target": np.array([0.5, 0.0, 0.2])}
 p.resetDebugVisualizerCamera(cam["dist"], cam["yaw"], cam["pitch"], cam["target"])
 
 
-def move_camera():
-    keys = p.getKeyboardEvents()
+def move_camera(keys):
     if p.B3G_LEFT_ARROW in keys:
         cam["yaw"] += 4
     if p.B3G_RIGHT_ARROW in keys:
@@ -50,16 +81,50 @@ def move_camera():
     p.resetDebugVisualizerCamera(cam["dist"], cam["yaw"], cam["pitch"], cam["target"])
 
 
+def poll_keys():
+    keys = p.getKeyboardEvents()
+    if p.getConnectionInfo()["isConnected"] == 0:
+        sys.exit(0)  # window closed -> don't hang
+    return keys
+
+
 # start = load_checkpoint(sac, path="models/b_best_4798_fixed_spawn_100pct_working.pt")
 # start = load_checkpoint(sac, path="models/b_best.pt") or load_checkpoint(sac)
-model_path = os.path.join(MODELS_DIR, "b_best.pt") if args.model == "best" else DEFAULT_PATH
-start = load_checkpoint(sac, path=model_path)
-if start == 0:
-    print("WARNING: no checkpoint found, evaluating an untrained policy")
-else:
+if args.sb3:
+    model = SB3SAC.load(args.sb3, device="cpu")
     print(
-        f"Loaded {os.path.basename(model_path)} (trained through episode {start - 1})"
+        f"Loaded {args.sb3} (ent_coef {float(model.log_ent_coef.exp().detach()):.4f})"
     )
+
+    def act(state):
+        action, _ = model.predict(state, deterministic=True)
+        return action
+
+else:
+    sac = SAC()
+    model_path = os.path.join(MODELS_DIR, "b_best.pt") if args.model == "best" else DEFAULT_PATH
+    start = load_checkpoint(sac, path=model_path)
+    if start == 0:
+        print("WARNING: no checkpoint found, evaluating an untrained policy")
+    else:
+        ck = torch.load(model_path, map_location="cpu", weights_only=False)
+        print(
+            f"Loaded {os.path.basename(model_path)} (trained through episode {start - 1}"
+            + f", alpha={ck.get('alpha', sac.alpha):g})"
+        )
+        spread = ramp_spread(start - 1)
+        env.set_spawn_spread(spread)
+        env.curriculum_prob = ramp_curriculum_prob(spread)
+        if args.curriculum is not None:
+            env.curriculum_prob = args.curriculum
+        print(
+            f"  ramp spread={spread:.3f} (episode knob), "
+            f"curriculum_prob={env.curriculum_prob:.3f}"
+            + ("" if args.curriculum is None else "  [--curriculum override]")
+        )
+
+    def act(state):
+        return sac.select_best_action(state).cpu().numpy()[0]
 
 # %%
 
@@ -72,12 +137,17 @@ for _ in range(n_episodes):
     done = False
     ep_reward = 0
     comps = dict.fromkeys(KEYS, 0.0)
+    terminated = False
+    truncated = False
     while not done:
-        move_camera()
-        action = sac.select_best_action(state)
-        next_state, reward, terminated, truncated, info = env.step(
-            action.detach().cpu().numpy()[0]
-        )
+        keys = poll_keys()
+        move_camera(keys)
+        if keys.get(p.B3G_SPACE, 0) & p.KEY_WAS_TRIGGERED:
+            print("(space: ending episode early)")
+            terminated = False
+            truncated = True
+            break
+        next_state, reward, terminated, truncated, info = env.step(act(state))
         done = terminated or truncated
         ep_reward += reward
         for k in KEYS:

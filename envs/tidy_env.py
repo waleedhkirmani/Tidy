@@ -1,5 +1,6 @@
 import pybullet as p
 import pybullet_data
+import gymnasium
 from gymnasium import spaces
 import numpy as np
 import time
@@ -16,18 +17,55 @@ WORKSPACE_HIGH = np.array([1.0, 0.4, 0.8], dtype=np.float32)
 # the cube so the grasp->lift->place chain is actually sampled by the critic.
 CURRICULUM_PROB = 0.0
 CURRICULUM_DESCEND_Z = 0.02  # lands EE ~0.045 (IK residual), proven firm grip
-HOLD_INCOME = 0.04  # per-step reward while holding a real (clamped) grasp
-CUBE_SPAWN_X = (0.2, 0.7)
-CUBE_SPAWN_Y = (-0.4, 0.4)
+# Hover-point jitter for the place probe: outside the funnel mouth
+# (full-spread half-extents 0.175 x 0.25) so a straight drop doesn't land.
+PLACE_HOVER_JITTER = (0.18, 0.28)
+# EE_x stalls (cube droops) past ~0.77 at the low hover height; keep targets
+# inside the arm's reach box or the offset silently collapses.
+PLACE_REACH_X = 0.77
+HOLD_INCOME = 0.1  # per-step reward while holding a real (clamped) grasp
+# Ramp over ABSOLUTE episode count (cumulative across Colab sessions via
+# load_checkpoint), so resuming a checkpoint keeps the ramp advancing.
+RAMP_EPISODES = 4000  # spread reaches full randomization after this many episodes
+CURRICULUM_PROBE = (
+    0.5  # fraction of early episodes starting above the cube; decays with spread
+)
 
 
-class TidyEnv:
+def ramp_spread(episode):
+    return max(0.1, min(1.0, episode / RAMP_EPISODES))
+
+
+def ramp_curriculum_prob(spread):
+    return CURRICULUM_PROBE * (1 - spread)
+
+
+# Spawn ramp anchors, symmetric about the workspace center (0.575, 0): the
+# cube and tray expand outward from these neutral points as ramp_spread(f)
+# grows over RAMP_EPISODES. HALF are the full-range (f=1) half-extents.
+CUBE_ANCHOR = (0.475, 0.0)
+CUBE_HALF = (0.25, 0.40)
+TRAY_ANCHOR = (0.675, 0.0)
+TRAY_HALF = (0.175, 0.25)
+
+
+class TidyEnv(gymnasium.Env):
     def __init__(
-        self, gui=True, randomize_cube_spawn=False, randomize_tray_spawn=False
+        self,
+        gui=True,
+        randomize_cube_spawn=False,
+        randomize_tray_spawn=False,
+        curriculum_prob=None,
+        probe="grasp",
     ):
         self.randomize_cube_spawn = randomize_cube_spawn
         self.randomize_tray_spawn = randomize_tray_spawn
         self.cube_spawn_spread = 1.0  # 0 = trained anchor, 1 = full range
+        self.tray_spawn_spread = 1.0
+        self.curriculum_prob = (
+            CURRICULUM_PROB if curriculum_prob is None else curriculum_prob
+        )
+        self.probe = probe  # "grasp" (above cube) or "place" (above tray, held)
 
         # RL
         self.action_space = spaces.Box(
@@ -68,7 +106,10 @@ class TidyEnv:
         # Robot
         self.robot = Robot()
 
-    def reset(self):
+    def reset(self, *, seed=None, options=None):
+        # ponytail: seed accepted for the gymnasium API but not applied — SB3
+        # re-passes the same seed on every episode, which would freeze the cube
+        # spawn. train.py/eval.py call reset() with no args, unchanged.
         if hasattr(self, "small_cube") and self.small_cube:
             p.removeBody(self.small_cube.id)
         if hasattr(self, "tray") and self.tray:
@@ -80,18 +121,63 @@ class TidyEnv:
 
         self.robot.reset()
         self.robot.open_claw()
-        if random.random() < CURRICULUM_PROB:
-            # Descend onto the cube with the claw open (same motion as the
-            # scripted demo) so episodes start one close away from a firm grip.
-            cx, cy = self.small_cube.get_current_pos()[:2]
-            z = 0.30
-            while z > CURRICULUM_DESCEND_Z:
-                z = max(z - 0.05, CURRICULUM_DESCEND_Z)
-                self._advance_toward([cx, cy, z])
+        self._window_income_claimed = False
+        # Single probe mode at a time. Place fires at HALF the grasp
+        # probability so the harder chain (grasp->carry->place) over the
+        # table-cube probe isn't drowned out by grab-world early reward.
+        gate = self.curriculum_prob * (0.5 if self.probe == "place" else 1.0)
+        if random.random() < gate:
+            if self.probe == "place":
+                # Place probe: start above the tray, cube already in hand, so
+                # the lower->open->success chain is actually sampled by the
+                # critic early in the ramp. Grasp failure falls back to a
+                # normal start.
+                if self.grasp_at_hand():
+                    tray_x, tray_y = self.tray.get_current_pos()[:2]
+                    cube = self.small_cube.get_current_pos()
+                    # Hover off dead-center (one axis at a time, random sign)
+                    # so the probe can't be solved by dropping straight down:
+                    # the agent must translate to align over the tray mouth.
+                    # Draws outside the arm's reach box are retried; if none
+                    # land (all-x-blocked), fall back to an inward +0.18 x.
+                    hover = None
+                    for _ in range(8):
+                        if random.random() < 0.5:
+                            d = random.uniform(*PLACE_HOVER_JITTER) * random.choice((-1.0, 1.0))
+                            hx, hy = tray_x + d, tray_y
+                        else:
+                            d = random.uniform(*PLACE_HOVER_JITTER) * random.choice((-1.0, 1.0))
+                            hx, hy = tray_x, tray_y + d
+                        if (
+                            0.15 <= hx <= PLACE_REACH_X
+                            and WORKSPACE_LOW[1] <= hy <= WORKSPACE_HIGH[1]
+                        ):
+                            hover = [hx, hy, 0.42]
+                            break
+                    if hover is None:
+                        hover = [max(0.15, tray_x - PLACE_HOVER_JITTER[0]), tray_y, 0.42]
+                    self._advance_toward([cube[0], cube[1], 0.6])  # lift
+                    self._advance_toward([tray_x, tray_y, 0.6])  # fly to tray (clear rim)
+                    for _ in range(8):  # converge; bursts move the loaded arm ~0.03 m each
+                        self._advance_toward(hover)  # hover off-center
+                        if math.dist(self.robot.get_end_effector_pos()[:2], hover[:2]) < 0.03:
+                            break
+            else:
+                # Grasp probe: descend onto the cube with the claw open (same
+                # motion as the scripted demo) so episodes start one close away
+                # from a firm grip.
+                cx, cy = self.small_cube.get_current_pos()[:2]
+                z = 0.30
+                while z > CURRICULUM_DESCEND_Z:
+                    z = max(z - 0.05, CURRICULUM_DESCEND_Z)
+                    self._advance_toward([cx, cy, z])
+
         for _ in range(40):
             p.stepSimulation()
         self.success_status = False
         self.step_count = 0
+        self._grasp_claimed = False
+        self._window_income_claimed = False
 
         info = {}
 
@@ -113,7 +199,10 @@ class TidyEnv:
         self._advance_toward(target_position)
 
         if action[3] > 0.5:
-            self.robot.open_claw()
+            # A clamped cube can only be released over the tray; a failed
+            # close can still be reopened to retry.
+            if not self.robot.is_gripping() or self._in_release_window():
+                self.robot.open_claw()
         elif self._in_grasp_window() and not self.robot.gripper_closed:
             # Gated like a gripper controller refusing a misaligned close:
             # in the window -> pure close (moving + closing in one step never
@@ -130,9 +219,11 @@ class TidyEnv:
 
     def _calculate_reward(self, prev_obs, obs, action):
         # Stateless: every term is a function of (s, a, s') -- the previous
-        # observation, the current action, and the current observation. No
-        # one-shot flags, no monotone-min trackers; gradients are potential
-        # differences that telescope, so bouncing can't farm them.
+        # observation, the current action, and the current observation. One
+        # exception: _grasp_claimed pays the +10 grasp once per episode, so
+        # re-grip cycling can't farm it and releasing is always free.
+        # Everything else is potential differences that telescope, so
+        # bouncing can't farm them.
         ee, cube, tray = obs[0:3], obs[3:6], obs[6:9]
         ee_prev, cube_prev = prev_obs[0:3], prev_obs[3:6]
         gripping = bool(obs[11])
@@ -145,24 +236,18 @@ class TidyEnv:
             "lower": 0,
             "success": 0,
         }
-        # grasp onset: transition into a real clamp pays once, and a genuine
-        # re-grasp after a drop pays again -- honest, observable in (s, s').
-        if gripping and not bool(prev_obs[11]):
+        # +10 on the first real clamp of the episode, never again. Releases
+        # and re-grasps cost/pay nothing, so the policy never fears opening the
+        # claw at the tray.
+        if gripping and not bool(prev_obs[11]) and not self._grasp_claimed:
             r["grasp"] = 10.0
-        # close bonus: a close intent fired inside the grasp band while the
-        # claw was open. The claw-open bit is read from the PREVIOUS obs, so
-        # "already closed" and "just closed" disambiguate from (s, a, s').
-        if action[3] <= 0.5 and self._in_grasp_window_obs(obs) and not self._fingers_closed(
-            prev_obs
-        ):
-            r["grasp"] += 1.0
+            self._grasp_claimed = True
 
         if not gripping:
             # potential: reach = -13 * ||cube - ee||; telescopes, backing off
             # pays negative, so in/out hunting collects nothing extra.
-            r["reach"] = (
-                13
-                * (np.linalg.norm(cube_prev - ee_prev) - np.linalg.norm(cube - ee))
+            r["reach"] = 13 * (
+                np.linalg.norm(cube_prev - ee_prev) - np.linalg.norm(cube - ee)
             )
             if self._in_grasp_window_obs(obs):
                 r["reach"] += 0.1  # window income: parks the EE where close can fire
@@ -192,15 +277,11 @@ class TidyEnv:
         if self._xy_dist(cube, tray) < 0.15:
             fingers_low = ee[2] < self.tray.top + 0.02
             if self._is_cube_in_tray_obs(obs) and fingers_low:
-                r["success"] = 50.0
+                r["success"] = 60.0
                 self.success_status = True
         self.step_rewards = r
-        floor_penalty = max(0.0, 5.0 * (0.02 - ee[2]))
+        floor_penalty = max(0.0, 1.0 * (0.02 - ee[2]))
         return sum(r.values()) - 0.01 - floor_penalty
-
-    @staticmethod
-    def _fingers_closed(obs):
-        return bool(obs[9] < 0.01 and obs[10] < 0.01)
 
     @staticmethod
     def _xy_dist(cube, tray):
@@ -223,10 +304,7 @@ class TidyEnv:
     def _is_cube_in_tray_obs(self, obs):
         # ponytail: +0.01 margin — the funnel-shaped tray wedges the hand with
         # the cube ~0.5mm above the rim; the cube is seated in the tray mouth.
-        return (
-            self._is_cube_centralized_obs(obs)
-            and obs[5] < self.tray.top + 0.01
-        )
+        return self._is_cube_centralized_obs(obs) and obs[5] < self.tray.top + 0.01
 
     def _in_grasp_window(self):
         ee = self.robot.get_end_effector_pos()
@@ -235,6 +313,16 @@ class TidyEnv:
         # ponytail: z-bottom widened (0.02 -> 0.005) so a far spawn that dives
         # just below the old band (EE ~0.013, aligned, close intent) can close
         return aligned and 0.005 <= ee[2] <= 0.04
+
+    def _in_release_window(self):
+        # Cube is over the tray mouth and low enough that opening drops it in.
+        cube = self.small_cube.get_current_pos()
+        tray = self.tray.get_current_pos()
+        over_tray = (
+            abs(cube[0] - tray[0]) < self.tray.half_length
+            and abs(cube[1] - tray[1]) < self.tray.half_width
+        )
+        return over_tray and cube[2] < self.tray.top + 0.02
 
     def _setup_physics(self):
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
@@ -257,11 +345,15 @@ class TidyEnv:
         cube = np.array(self.small_cube.get_current_pos(), dtype=np.float32)
         tray = np.array(self.tray.get_current_pos(), dtype=np.float32)
         fingers = np.array(
-            [p.getJointState(self.robot.id, 9)[0], p.getJointState(self.robot.id, 10)[0]],
+            [
+                p.getJointState(self.robot.id, 9)[0],
+                p.getJointState(self.robot.id, 10)[0],
+            ],
             dtype=np.float32,
         )
         ee_vel = np.array(
-            p.getLinkState(self.robot.id, 11, computeLinkVelocity=1)[6], dtype=np.float32
+            p.getLinkState(self.robot.id, 11, computeLinkVelocity=1)[6],
+            dtype=np.float32,
         )
         return np.concatenate(
             [
@@ -275,17 +367,19 @@ class TidyEnv:
             ]
         ).astype(np.float32)
 
-    def set_cube_spawn_spread(self, fraction):
+    def set_spawn_spread(self, fraction):
+        # One ramp variable controls cube AND tray randomization together.
         self.cube_spawn_spread = fraction
+        self.tray_spawn_spread = fraction
 
     def _sample_cube_spawn(self):
         f = self.cube_spawn_spread
-        cx = 0.45
-        cy = 0.40 * (1 - f)  # lerp center 0.40 -> 0.0
+        cx, cy = CUBE_ANCHOR
+        hx, hy = CUBE_HALF
         tray_pos = self.tray.get_current_pos()
         while True:
-            x = random.uniform(cx - 0.25 * f, cx + 0.25 * f)
-            y = random.uniform(cy - 0.40 * f, cy + 0.40 * f)
+            x = random.uniform(cx - hx * f, cx + hx * f)
+            y = random.uniform(cy - hy * f, cy + hy * f)
             if not (
                 abs(x - tray_pos[0]) < self.tray.half_length + 0.05
                 and abs(y - tray_pos[1]) < self.tray.half_width + 0.05
@@ -299,7 +393,14 @@ class TidyEnv:
         return self.small_cube
 
     def _sample_tray_spawn(self):
-        return [random.uniform(*CUBE_SPAWN_X), random.uniform(*CUBE_SPAWN_Y), 0.0]
+        f = self.tray_spawn_spread
+        tx, ty = TRAY_ANCHOR
+        hx, hy = TRAY_HALF
+        x = random.uniform(tx - hx * f, tx + hx * f)
+        y = random.uniform(ty - hy * f, ty + hy * f)
+        return np.clip(
+            [x, y, 0.0], WORKSPACE_LOW, [WORKSPACE_HIGH[0], WORKSPACE_HIGH[1], 0.0]
+        )
 
     def _spawn_tray(self, basePos=[0.625, -0.30, 0.0], globScale=0.25):
         if self.randomize_tray_spawn:
@@ -414,6 +515,19 @@ class TidyEnv:
             last_distance = distance
         print("move_to: did not converge")
         return False
+
+    def grasp_at_hand(self):
+        # Scripted: descend onto the cube with the claw open (closing during
+        # the descend would turn it into a push and wedge the fingers over the
+        # cube top), then close once low, and nudge down to seat a real clamp.
+        # Returns True on a firm grip, else the cube stays ungrasped.
+        cx, cy = self.small_cube.get_current_pos()[:2]
+        for z in (0.12, 0.045, 0.02):
+            self._advance_toward([cx, cy, z])
+        self.robot.close_claw()
+        if not self.robot.is_gripping():
+            self._advance_toward([cx, cy, 0.005])
+        return self.robot.is_gripping()
 
     def motion(self):
         self._move_to([0.43, 0.42, 0.7])

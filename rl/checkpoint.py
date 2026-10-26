@@ -5,7 +5,7 @@ MODELS_DIR = os.environ.get("TIDY_MODELS_DIR", "models")
 DEFAULT_PATH = os.path.join(MODELS_DIR, "b_model_latest.pt")
 
 
-def save_checkpoint(agent, episode, path=DEFAULT_PATH):
+def save_checkpoint(agent, episode, path=DEFAULT_PATH, buffer=None):
     checkpoint = {
         "episode": episode,
         "actor": agent.actor.state_dict(),
@@ -15,18 +15,25 @@ def save_checkpoint(agent, episode, path=DEFAULT_PATH):
         "target_critic2": agent.target_critic2.state_dict(),
         "actor_optimizer": agent.actor_optimizer.state_dict(),
         "critic_optimizer": agent.critic_optimizer.state_dict(),
-        "log_alpha": agent.log_alpha.detach(),
+        # Recorded for reproducibility, but deliberately NOT restored on load:
+        # alpha is a hyperparameter now, and old checkpoints carry the collapsed
+        # auto-tuned value (~0.002) that this change exists to escape. The
+        # constructor value / train.py --alpha wins.
+        "alpha": agent.alpha,
+        # Replay buffer rides inside b_model_latest.pt (the resume point) so a
+        # fresh run -- deleting that file -- flushes model AND buffer in one step.
+        "buffer": buffer.save_state() if buffer is not None else None,
     }
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(checkpoint, path)
 
 
-def load_checkpoint(agent, path=DEFAULT_PATH):
+def load_checkpoint(agent, path=DEFAULT_PATH, restore_buffer=None):
     if not os.path.exists(path):
         return 0
 
-    checkpoint = torch.load(path, map_location="cpu")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
     try:
         agent.actor.load_state_dict(checkpoint["actor"])
         agent.critic1.load_state_dict(checkpoint["critic1"])
@@ -46,11 +53,9 @@ def load_checkpoint(agent, path=DEFAULT_PATH):
         )
         return 0
 
-    # Checkpoints saved before the temperature was learnable have no log_alpha.
-    # Presence-guarded rather than checkpoint["log_alpha"]: a missing key inside
-    # the block above would return 0 and silently restart training from scratch
-    # with a trained policy discarded. Here it just keeps the constructor alpha.
-    if "log_alpha" in checkpoint:
-        agent.log_alpha.data.copy_(checkpoint["log_alpha"])
-
+    # No alpha restore: see the note in save_checkpoint. Old checkpoints' stale
+    # log_alpha key is intentionally ignored rather than exp()'d back into alpha.
+    ck_buffer = checkpoint.get("buffer")
+    if restore_buffer is not None and ck_buffer is not None:
+        restore_buffer.restore_state(ck_buffer)
     return checkpoint["episode"] + 1

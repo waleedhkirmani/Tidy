@@ -103,3 +103,17 @@ Training Loops:
   properties were introduced by me to stop the robot from reward hacking.
   Now there are 18 instead of 9 in the observation.
   I made the alpha for entropy learnable. It exploded during the first run due to a sign issue in the formula, fixed it
+  The buffer was too small with 20K episodes. I increased it to 670K. Also, using fixed alpha for an experiment
+  Decreased the buffer to 400K as it was very large. Increased batch size to 256 instead of 64. These updates
+  should in theory help with the sparse rewards. Bringing back the ramp, with a more neutral center now. Curriculum
+  probe also added back. Some normalization thingy recommended by AI as well
+  The floor penalty was scaled by 5, causing 0.5 per step penalty. I removed the 5x scale
+  There was a grasp hack. Fixed it by giving -10 on dropping. The -10 penalty ends after a certain amount of hold
+  Added full reverse curriculum. Divided the grasp curriculum prob into half by adding a place one too. Increased
+  hold reward per step to 0.1 from 0.08. Increase success reward to 60 as well to counter reward hacking by hold.
+  There used to be a parking reward to encourage the robot to get into the window for a grasp. It now started
+  overshadowing hold reward. As the curriculum is strong enough to discover the grasp itself, I am removing 
+  that parking reward.
+  Bringing the parking reward back, it helped to guide the arm in the initial stages of training. 
+  Reduced the entropy to 0.1 from 0.2. Hard locked the fingers to stay together after grasping, and then only being
+  able to open when near a certain distance (2cm) from the cube.

@@ -7,5 +7,6 @@ rclone copy . drive:Tidy/code \
   --exclude ".venv/**" \
   --exclude "models/**" \
   --exclude ".git/**" \
-  --exclude "__pycache__/**"
+  --exclude "__pycache__/**" \
+  --exclude ".mypy_cache/**"
 echo "Code synced to drive:Tidy/code"

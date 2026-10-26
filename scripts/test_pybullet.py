@@ -40,13 +40,10 @@ for joint in range(p.getNumJoints(robot)):
         bodyUniqueId=robot, jointIndex=joint, controlMode=p.VELOCITY_CONTROL, force=0
     )
 
-t = 0.0
 
 # Main simulation loop
 while p.isConnected():
-    # Oscillate Joint 1 between -1.5 and +1.5 radians
-    target = 1.5 * math.sin(t)
-
+    target = 0.7
     p.setJointMotorControl2(
         bodyUniqueId=robot,
         jointIndex=0,  # panda_joint1
@@ -59,6 +56,5 @@ while p.isConnected():
 
     time.sleep(1 / 240)
 
-    t += 0.01
 
 p.disconnect()
